@@ -11,8 +11,8 @@ CORS(app)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9",
     "Referer": "https://fa-fa.kz/"
 }
 
@@ -26,63 +26,61 @@ def get_rate():
     if not from_city or not to_city:
         return jsonify({"found": False, "error": "Города не указаны"}), 400
 
+    f_clean = from_city.lower()
+    t_clean = to_city.lower()
+
+    f_stem = f_clean[:5] if len(f_clean) >= 5 else f_clean
+    t_stem = t_clean[:5] if len(t_clean) >= 5 else t_clean
+
     prices = []
     
-    search_params = {
-        "from_city": from_city,
-        "to_city": to_city
-    }
-    query_str = urllib.parse.urlencode(search_params)
-    
     urls_to_try = [
-        f"https://fa-fa.kz/search_cargo/?{query_str}",
-        f"https://fa-fa.kz/search_cargo/?from_city={urllib.parse.quote(from_city)}",
-        f"https://m.fa-fa.kz/search_cargo/?{query_str}"
+        f"https://fa-fa.kz/search_cargo/?city_from={urllib.parse.quote(from_city)}&city_to={urllib.parse.quote(to_city)}",
+        f"https://fa-fa.kz/search_cargo/?from_city={urllib.parse.quote(from_city)}&to_city={urllib.parse.quote(to_city)}",
+        f"https://fa-fa.kz/ru/cargo/",
+        f"https://fa-fa.kz/search_cargo/"
     ]
 
     for url in urls_to_try:
         try:
-            res = requests.get(url, headers=HEADERS, timeout=12)
+            res = requests.get(url, headers=HEADERS, timeout=10)
             if res.status_code != 200 or not res.text:
                 continue
 
             soup = BeautifulSoup(res.text, "html.parser")
-            rows = soup.select(".cargo_item, .load_item, tr, .search_result_item, .list_item")
+            items = soup.select("tr, .cargo-item, .item, .search_item, div[class*='cargo'], div[class*='load']")
             
-            for row in rows:
-                text = row.get_text(" ", strip=True)
-                lower_text = text.lower()
+            for item in items:
+                text = item.get_text(" ", strip=True).lower()
+                
+                if f_stem in text and t_stem in text:
+                    kzt = re.findall(r"(\d[\d\s]{3,7})\s*(?:тг|тенге|₸)", text, re.IGNORECASE)
+                    for m in kzt:
+                        val = int(re.sub(r"\D", "", m))
+                        if 30000 <= val <= 4500000:
+                            prices.append(val)
 
-                if to_city.lower() not in lower_text and len(urls_to_try) > 1:
-                    continue
+                    rub = re.findall(r"(\d[\d\s]{3,6})\s*(?:руб|р\b|₽)", text, re.IGNORECASE)
+                    for m in rub:
+                        val = int(re.sub(r"\D", "", m))
+                        if 5000 <= val <= 700000:
+                            prices.append(int(val * RUB_KZT_RATE))
 
-                kzt_matches = re.findall(r"(\d[\d\s]{3,8})\s*(?:тг|тенге|₸)", text, re.IGNORECASE)
-                for m in kzt_matches:
-                    val = int(re.sub(r"\D", "", m))
-                    if 40000 <= val <= 5000000:
-                        prices.append(val)
-
-                rub_matches = re.findall(r"(\d[\d\s]{3,7})\s*(?:руб|р\b|₽)", text, re.IGNORECASE)
-                for m in rub_matches:
-                    val = int(re.sub(r"\D", "", m))
-                    if 5000 <= val <= 800000:
-                        prices.append(int(val * RUB_KZT_RATE))
-
-            if prices:
+            if len(prices) >= 2:
                 break
         except Exception as e:
-            print(f"Ошибка запроса к {url}: {e}")
+            print(f"Log error for {url}: {e}")
             continue
 
     if prices:
         prices.sort()
-        valid_prices = prices
+        valid = prices
         if len(prices) >= 4:
-            valid_prices = prices[1:-1]
+            valid = prices[1:-1]
 
-        min_p = min(valid_prices)
-        max_p = max(valid_prices)
-        avg_p = int(round(sum(valid_prices) / len(valid_prices) / 1000) * 1000)
+        min_p = min(valid)
+        max_p = max(valid)
+        avg_p = int(round(sum(valid) / len(valid) / 1000) * 1000)
 
         return jsonify({
             "found": True,
@@ -90,12 +88,12 @@ def get_rate():
             "avg_price": avg_p,
             "max_price": max_p,
             "count": len(prices),
-            "source": f"Биржа FA-FA.kz (активных заявок: {len(prices)})"
+            "source": f"FA-FA.kz (Найдено заявок: {len(prices)})"
         })
 
     return jsonify({
         "found": False,
-        "source": "FA-FA: нет опубликованных открытых ставок по направлению"
+        "source": f"На FA-FA нет активных ставок по направлению {from_city} — {to_city}"
     })
 
 if __name__ == "__main__":
