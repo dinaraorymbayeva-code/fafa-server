@@ -22,80 +22,57 @@ def get_rate():
     session = requests.Session()
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "ru-RU,ru;q=0.9",
         "Referer": "https://fa-fa.kz/"
     })
 
-    # Сначала инициируем сессию на главной FA-FA для получения рабочих cookies
+    search_url = f"https://fa-fa.kz/search_cargo/?from_city={urllib.parse.quote(from_city)}&to_city={urllib.parse.quote(to_city)}"
+    
     try:
-        session.get("https://fa-fa.kz/", timeout=7)
-    except Exception:
-        pass
+        resp = session.get(search_url, timeout=12)
+        status = resp.status_code
+        html = resp.text
+    except Exception as e:
+        return jsonify({"found": False, "debug_error": str(e), "message": "Сбой соединения с FA-FA"})
 
-    rates = []
-    f_stem = from_city.lower()[:4]
-    t_stem = to_city.lower()[:4]
+    # Диагностика: если FA-FA вернул блокировку или пустую страницу
+    if status != 200:
+        return jsonify({"found": False, "status_code": status, "message": f"FA-FA вернул код ошибки {status}"})
 
-    # Список целевых точек поиска биржи
-    search_urls = [
-        f"https://fa-fa.kz/search_cargo/?from_city={urllib.parse.quote(from_city)}&to_city={urllib.parse.quote(to_city)}",
-        f"https://fa-fa.kz/search_cargo/?city_from={urllib.parse.quote(from_city)}&city_to={urllib.parse.quote(to_city)}",
-        "https://fa-fa.kz/search_cargo/"
-    ]
+    soup = BeautifulSoup(html, "html.parser")
+    page_title = soup.title.string.strip() if soup.title else "Без заголовка"
+    
+    # Ищем любые упоминания цен в тексте всей страницы
+    all_text = soup.get_text(" ", strip=True)
+    kzt_all = re.findall(r"(\d[\d\s]{3,7})\s*(?:тг|тенге|₸)", all_text, re.IGNORECASE)
+    
+    prices = []
+    for m in kzt_all:
+        val = int(re.sub(r"\D", "", m))
+        if 40000 <= val <= 3500000:
+            prices.append(val)
 
-    for target_url in search_urls:
-        try:
-            resp = session.get(target_url, timeout=10)
-            if resp.status_code != 200 or not resp.text:
-                continue
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-            rows = soup.find_all(["tr", "div", "li"], class_=re.compile(r"(cargo|item|row|search|load)", re.I))
-
-            for r in rows:
-                txt = r.get_text(" ", strip=True).lower()
-                # Проверяем вхождение обоих городов в блок заявки
-                if f_stem in txt and t_stem in txt:
-                    # Поиск сумм в тенге
-                    kzt_matches = re.findall(r"(\d[\d\s]{3,7})\s*(?:тг|тенге|₸|kzt)", txt)
-                    for m in kzt_matches:
-                        num = int(re.sub(r"\D", "", m))
-                        if 30000 <= num <= 4500000:
-                            rates.append(num)
-
-                    # Поиск сумм в рублях (конвертируем в тенге)
-                    rub_matches = re.findall(r"(\d[\d\s]{3,6})\s*(?:руб|р\b|₽|rub)", txt)
-                    for m in rub_matches:
-                        num = int(re.sub(r"\D", "", m))
-                        if 5000 <= num <= 700000:
-                            rates.append(int(num * RUB_TO_KZT))
-
-            if len(rates) >= 1:
-                break
-        except Exception as e:
-            print(f"Fetch error: {e}")
-            continue
-
-    if rates:
-        rates.sort()
-        # Исключаем явные выбросы, если ставок много
-        valid_rates = rates[1:-1] if len(rates) >= 4 else rates
-        avg_val = int(round(sum(valid_rates) / len(valid_rates) / 1000) * 1000)
-
+    if prices:
+        prices.sort()
+        valid = prices[1:-1] if len(prices) >= 4 else prices
+        avg_val = int(round(sum(valid) / len(valid) / 1000) * 1000)
         return jsonify({
             "found": True,
-            "min_price": min(valid_rates),
+            "min_price": min(valid),
             "avg_price": avg_val,
-            "max_price": max(valid_rates),
-            "count": len(rates),
-            "source": f"FA-FA.kz (Найдено заявок: {len(rates)})"
+            "max_price": max(valid),
+            "count": len(prices),
+            "source": f"FA-FA.kz live ({len(prices)} заявок)"
         })
 
-    # Если заявок с открытой ставкой нет, возвращаем честный ответ без выдуманных цифр
+    # Возвращаем точную причину, что именно ответила биржа FA-FA
     return jsonify({
         "found": False,
-        "message": f"На FA-FA нет открытых ставок по направлению {from_city} — {to_city}"
+        "title": page_title,
+        "html_length": len(html),
+        "sample": html[:300].strip(),
+        "message": f"Биржа открылась ({page_title}), но активных цен не обнаружено"
     })
 
 if __name__ == "__main__":
