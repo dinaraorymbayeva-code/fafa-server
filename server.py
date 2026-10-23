@@ -1,93 +1,101 @@
 import os
-import math
 import re
 import requests
+from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from bs4 import BeautifulSoup
+import urllib.parse
 
 app = Flask(__name__)
 CORS(app)
 
-RUB_TO_KZT_RATE = 5.2
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://fa-fa.kz/"
+}
 
-def parse_fafa_direct(from_city, to_city):
-    """Прямой сбор реальных ставок через сессию формы поиска FA-FA"""
-    session = requests.Session()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Referer": "https://fa-fa.kz/search_load/",
-        "Accept-Language": "ru-RU,ru;q=0.9"
-    }
-    
-    rates = []
-    try:
-        # Шаг 1: инициализация страницы поиска
-        init_res = session.get("https://fa-fa.kz/search_load/", headers=headers, timeout=6)
-        
-        # Шаг 2: отправка фильтра по городам (20 тонн)
-        post_data = {
-            "from_name": from_city,
-            "to_name": to_city,
-            "weight_to": "22",
-            "volume_to": "92"
-        }
-        search_res = session.post("https://fa-fa.kz/search_load/", data=post_data, headers=headers, timeout=6)
-        
-        soup = BeautifulSoup(search_res.text, "html.parser")
-        
-        # Извлекаем все строки таблицы, где указана цена
-        rows = soup.find_all(text=re.compile(r"(?:тнг|тг|₸|руб|\bтенге\b)", re.I))
-        for item in rows:
-            text = item.strip().lower()
-            if "договор" in text or "дог" in text:
-                continue
-            digits = re.sub(r"[^\d]", "", text)
-            if not digits:
-                continue
-            val = int(digits)
-            if "руб" in text or "rub" in text or "₽" in text:
-                val = int(val * RUB_TO_KZT_RATE)
-                
-            # Реальные ставки для фуры
-            if 150000 <= val <= 3500000:
-                rates.append(val)
-    except Exception as e:
-        print("Ошибка сессии FA-FA:", e)
-
-    return rates
+RUB_KZT_RATE = 5.2
 
 @app.route("/get_rate", methods=["GET"])
 def get_rate():
-    from_c = request.args.get("from", "").strip()
-    to_c = request.args.get("to", "").strip()
+    from_city = request.args.get("from", "").strip()
+    to_city = request.args.get("to", "").strip()
 
-    if not from_c or not to_c:
-        return jsonify({"error": "Укажите города"}), 400
+    if not from_city or not to_city:
+        return jsonify({"found": False, "error": "Города не указаны"}), 400
 
-    rates = parse_fafa_direct(from_c, to_c)
+    prices = []
+    
+    search_params = {
+        "from_city": from_city,
+        "to_city": to_city
+    }
+    query_str = urllib.parse.urlencode(search_params)
+    
+    urls_to_try = [
+        f"https://fa-fa.kz/search_cargo/?{query_str}",
+        f"https://fa-fa.kz/search_cargo/?from_city={urllib.parse.quote(from_city)}",
+        f"https://m.fa-fa.kz/search_cargo/?{query_str}"
+    ]
 
-    if rates and len(rates) >= 2:
-        rates.sort()
-        # Отсекаем 10% самых крайних выбросов
-        mid_rates = rates[1:-1] if len(rates) > 4 else rates
-        min_p = min(mid_rates)
-        max_p = max(mid_rates)
-        avg_p = int(sum(mid_rates) / len(mid_rates))
-        
+    for url in urls_to_try:
+        try:
+            res = requests.get(url, headers=HEADERS, timeout=12)
+            if res.status_code != 200 or not res.text:
+                continue
+
+            soup = BeautifulSoup(res.text, "html.parser")
+            rows = soup.select(".cargo_item, .load_item, tr, .search_result_item, .list_item")
+            
+            for row in rows:
+                text = row.get_text(" ", strip=True)
+                lower_text = text.lower()
+
+                if to_city.lower() not in lower_text and len(urls_to_try) > 1:
+                    continue
+
+                kzt_matches = re.findall(r"(\d[\d\s]{3,8})\s*(?:тг|тенге|₸)", text, re.IGNORECASE)
+                for m in kzt_matches:
+                    val = int(re.sub(r"\D", "", m))
+                    if 40000 <= val <= 5000000:
+                        prices.append(val)
+
+                rub_matches = re.findall(r"(\d[\d\s]{3,7})\s*(?:руб|р\b|₽)", text, re.IGNORECASE)
+                for m in rub_matches:
+                    val = int(re.sub(r"\D", "", m))
+                    if 5000 <= val <= 800000:
+                        prices.append(int(val * RUB_KZT_RATE))
+
+            if prices:
+                break
+        except Exception as e:
+            print(f"Ошибка запроса к {url}: {e}")
+            continue
+
+    if prices:
+        prices.sort()
+        valid_prices = prices
+        if len(prices) >= 4:
+            valid_prices = prices[1:-1]
+
+        min_p = min(valid_prices)
+        max_p = max(valid_prices)
+        avg_p = int(round(sum(valid_prices) / len(valid_prices) / 1000) * 1000)
+
         return jsonify({
             "found": True,
-            "min_price": int(round(min_p / 1000.0) * 1000),
-            "avg_price": int(round(avg_p / 1000.0) * 1000),
-            "max_price": int(round(max_p / 1000.0) * 1000),
-            "count": len(rates),
-            "source": f"Живые торги FA-FA (найдено {len(rates)} заявок)"
+            "min_price": min_p,
+            "avg_price": avg_p,
+            "max_price": max_p,
+            "count": len(prices),
+            "source": f"Биржа FA-FA.kz (активных заявок: {len(prices)})"
         })
 
-    # Если биржа вернула 0 заявок (нет грузов по фильтру)
     return jsonify({
         "found": False,
-        "source": "На FA-FA нет активных заявок. Укажите ставку вручную"
+        "source": "FA-FA: нет опубликованных открытых ставок по направлению"
     })
 
 if __name__ == "__main__":
