@@ -1,15 +1,15 @@
 import os
 import re
+import urllib.parse
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import urllib.parse
 
 app = Flask(__name__)
 CORS(app)
 
-# Авторизованные заголовки вашей учетной записи FA-FA
+# Авторизованные cookies сессии FA-FA
 FAFA_COOKIES = (
     "_ym_uid=1674474011683190655; bbuserid=129703; "
     "_ymab_param=cifDjj0VEQgQ8SI0Pkf5D2vG05MdGpYoDGpy9ZLFq9JAeXH3yIcPR-M1nlsexCib58c_mER79E1oTECBSnnmsHexGJA; "
@@ -42,7 +42,6 @@ def get_rate():
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    # Запрос напрямую в рабочий раздел выдачи грузов FA-FA
     search_url = f"https://fa-fa.kz/search_load/?from_city={urllib.parse.quote(from_city)}&to_city={urllib.parse.quote(to_city)}"
 
     try:
@@ -53,11 +52,9 @@ def get_rate():
         soup = BeautifulSoup(resp.text, "html.parser")
         prices = []
 
-        # Обход всех строк таблицы и карточек грузов
         for row in soup.find_all(["tr", "div", "li"]):
             text = row.get_text(" ", strip=True).lower()
             if f_stem in text and t_stem in text:
-                # Поиск формата цен FA-FA: "140.000 тнг", "110 000 тг", "150000 ₸"
                 matches = re.findall(r"(\d{1,3}(?:[\.\s]\d{3})+|\d{4,7})\s*(?:тнг|тг|тенге|₸)", text)
                 for m in matches:
                     val = int(re.sub(r"\D", "", m))
@@ -66,8 +63,26 @@ def get_rate():
 
         if prices:
             prices.sort()
-            # Отсекаем разовые крайние выбросы, если предложений много
             clean = prices[1:-1] if len(prices) >= 4 else prices
             avg_val = int(round(sum(clean) / len(clean) / 1000) * 1000)
 
             return jsonify({
+                "found": True,
+                "min_price": min(clean),
+                "avg_price": avg_val,
+                "max_price": max(clean),
+                "count": len(prices),
+                "source": f"FA-FA.kz (активных заявок: {len(prices)})"
+            })
+
+        return jsonify({
+            "found": False,
+            "message": f"На FA-FA нет активных ставок с открытой ценой по направлению {from_city} — {to_city}"
+        })
+
+    except Exception as e:
+        return jsonify({"found": False, "error": str(e)}), 500
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
