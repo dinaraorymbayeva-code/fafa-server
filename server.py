@@ -1,5 +1,6 @@
 import os
 import re
+import urllib.parse
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify
@@ -22,7 +23,7 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9",
-    "Referer": "https://fa-fa.kz/search_load/",
+    "Referer": "https://fa-fa.kz/search_load/?sid=56979550",
     "Origin": "https://fa-fa.kz",
     "Cookie": FAFA_COOKIES
 }
@@ -41,41 +42,46 @@ def get_rate():
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    # 1. Отправляем поисковую форму POST-запросом, как делает браузер
-    form_data = {
-        "city_from_name": from_city,
-        "city_to_name": to_city,
-        "action": "search",
-        "weight_to": "22",
-        "volume_to": "130"
-    }
-
+    # Запрашиваем страницу поиска грузов
+    search_url = f"https://fa-fa.kz/search_load/?sid=56979550"
     try:
-        resp = session.post("https://fa-fa.kz/search_load/", data=form_data, timeout=12, allow_redirects=True)
+        resp = session.get(search_url, timeout=12)
         html = resp.text
     except Exception as e:
         return jsonify({"found": False, "error": str(e)}), 500
 
-    # Если редирект не сработал, делаем GET по полученной сессии
-    if "Найдено грузов" not in html:
-        try:
-            resp_get = session.get(resp.url if resp.url != "https://fa-fa.kz/search_load/" else "https://fa-fa.kz/search_load/?sid=56979550", timeout=12)
-            html = resp_get.text
-        except Exception:
-            pass
-
     soup = BeautifulSoup(html, "html.parser")
     prices = []
 
-    # Разбор текстовых строк таблицы грузов
-    for row in soup.find_all(["tr", "div", "li"]):
-        text = row.get_text(" ", strip=True).lower()
-        if f_stem in text and t_stem in text:
-            matches = re.findall(r"(\d{1,3}(?:[\.\s]\d{3})+|\d{4,7})\s*(?:тнг|тг|тенге|₸)", text)
+    # 1. Сначала ищем по отдельным строкам таблицы (tr)
+    for tr in soup.find_all("tr"):
+        txt = tr.get_text(" ", strip=True).lower()
+        if f_stem in txt and t_stem in txt:
+            matches = re.findall(r"(\d{1,3}(?:[\.\s]\d{3})+|\d{4,7})\s*(?:тнг|тг|тенге|₸)", txt)
             for m in matches:
                 val = int(re.sub(r"\D", "", m))
                 if 35000 <= val <= 4000000:
                     prices.append(val)
+
+    # 2. Если табличная структура блочная (div карточки грузов)
+    if not prices:
+        for card in soup.find_all(lambda tag: tag.name in ['div', 'li'] and (f_stem in tag.get_text().lower() and t_stem in tag.get_text().lower())):
+            # Берем только компактные блоки, чтобы не захватить всю страницу
+            if len(card.get_text()) < 600:
+                card_txt = card.get_text(" ", strip=True).lower()
+                matches = re.findall(r"(\d{1,3}(?:[\.\s]\d{3})+|\d{4,7})\s*(?:тнг|тг|тенге|₸)", card_txt)
+                for m in matches:
+                    val = int(re.sub(r"\D", "", m))
+                    if 35000 <= val <= 4000000:
+                        prices.append(val)
+
+    # 3. Прямой поиск всех сумм в тенге на активной странице выдачи
+    if not prices:
+        all_matches = re.findall(r"(\d{2,3}(?:[\.\s]\d{3}))\s*(?:тнг|тг|тенге|₸)", html, re.IGNORECASE)
+        for m in all_matches:
+            val = int(re.sub(r"\D", "", m))
+            if 60000 <= val <= 1500000:
+                prices.append(val)
 
     if prices:
         prices.sort()
